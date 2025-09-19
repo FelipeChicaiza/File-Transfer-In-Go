@@ -73,13 +73,10 @@ Next Steps
 
 This project is intentionally simple. Future improvements will make the system more robust and closer to a true DFS, such as:
 
-Adding file size headers for precise transfers
+- Adding file size headers for precise transfers
+- Supporting multiple requests over a single connection
+- Error handling and retries
+- Authentication and access control
+- Replication across multiple nodes
 
-Supporting multiple requests over a single connection
-
-Error handling and retries
-
-Authentication and access control
-
-Replication across multiple nodes
 
