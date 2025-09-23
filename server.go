@@ -1,93 +1,254 @@
+// server.go
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strings"
+	"path/filepath"
 )
 
+const (
+	OpUpload   = 1 // used for sending file bytes (both directions)
+	OpDownload = 2 // request to download a file (client -> server)
+	OpAck      = 3 // acknowledgement
+	OpError    = 4 // error with message in Data
+)
+
+type Packet struct {
+	Op       byte
+	Filename string
+	FileSize int64
+	Data     []byte
+}
+
+// Encode serializes a Packet to bytes
+func (p *Packet) Encode() ([]byte, error) {
+	if len(p.Filename) > 255 {
+		return nil, fmt.Errorf("filename too long")
+	}
+	buf := new(bytes.Buffer)
+
+	// OP
+	if err := buf.WriteByte(p.Op); err != nil {
+		return nil, err
+	}
+
+	// filename length + filename
+	if err := buf.WriteByte(byte(len(p.Filename))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(p.Filename); err != nil {
+		return nil, err
+	}
+
+	// file size (8 bytes)
+	if err := binary.Write(buf, binary.BigEndian, p.FileSize); err != nil {
+		return nil, err
+	}
+
+	// data (if any)
+	if p.Data != nil && len(p.Data) > 0 {
+		if _, err := buf.Write(p.Data); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// Decode reads bytes from r to construct a Packet.
+// It reads header fields first, then reads FileSize bytes into Data if needed.
+func Decode(r io.Reader) (*Packet, error) {
+	p := &Packet{}
+
+	// 1 byte OP
+	op := make([]byte, 1)
+	if _, err := io.ReadFull(r, op); err != nil {
+		return nil, err
+	}
+	p.Op = op[0]
+
+	// 1 byte filename length
+	lenb := make([]byte, 1)
+	if _, err := io.ReadFull(r, lenb); err != nil {
+		return nil, err
+	}
+	nameLen := int(lenb[0])
+
+	// filename
+	if nameLen > 0 {
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(r, nameBuf); err != nil {
+			return nil, err
+		}
+		p.Filename = string(nameBuf)
+	} else {
+		p.Filename = ""
+	}
+
+	// file size (8 bytes)
+	if err := binary.Read(r, binary.BigEndian, &p.FileSize); err != nil {
+		return nil, err
+	}
+
+	// If file size > 0, read Data
+	if p.FileSize > 0 {
+		if p.FileSize > (1 << 31) { // safety: 2GB limit in this simple example
+			return nil, fmt.Errorf("file too large")
+		}
+		data := make([]byte, p.FileSize)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		p.Data = data
+	} else {
+		p.Data = nil
+	}
+
+	return p, nil
+}
+
 func main() {
-	ln, err := net.Listen("tcp", ":8080")
+	const listenAddr = ":8080"
+
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		fmt.Println("Error starting server:", err)
+		fmt.Println("Error listening:", err)
 		return
 	}
 	defer ln.Close()
-	fmt.Println("File server listenning on port 8080...")
+	fmt.Println("File server listening on", listenAddr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("Error accepting conneciton:", err)
+			fmt.Println("Accept error:", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConn(conn)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConn(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
+	fmt.Println("Client connected:", conn.RemoteAddr())
 
+	// We'll repeatedly decode packets from the same connection.
+	// Note: Decode uses io.ReadFull, which blocks until expected bytes are read.
 	for {
-		commandLine, err := reader.ReadString('\n')
+		pkt, err := Decode(conn)
 		if err != nil {
-			fmt.Println("Client disconnected")
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				fmt.Println("Client disconnected:", conn.RemoteAddr())
+			} else {
+				fmt.Println("Decode error:", err)
+			}
 			return
 		}
 
-		commandLine = strings.TrimSpace(commandLine)
-		parts := strings.Split(commandLine, " ")
-		if len(parts) < 2 {
-			conn.Write([]byte("Invalid command\n"))
-			continue
+		switch pkt.Op {
+		case OpUpload:
+			if err := handleUpload(pkt); err != nil {
+				sendError(conn, err.Error())
+				fmt.Println("Upload error:", err)
+			} else {
+				sendAck(conn, "upload successful")
+				fmt.Println("Saved file:", pkt.Filename)
+			}
+
+		case OpDownload:
+			if err := handleDownload(conn, pkt.Filename); err != nil {
+				sendError(conn, err.Error())
+				fmt.Println("Download error:", err)
+			} else {
+				fmt.Println("Served file:", pkt.Filename)
+			}
+
+		default:
+			sendError(conn, "unknown operation")
 		}
-
-		cmd, filename := parts[0], parts[1]
-
-		if cmd == "UPLOAD" {
-			receiveFile(conn, reader, filename)
-		} else if cmd == "DOWNLOAD" {
-			sendFile(conn, filename)
-		} else {
-			conn.Write([]byte("Uknown command\n"))
-		}
-
 	}
 }
 
-func receiveFile(conn net.Conn, reader *bufio.Reader, filename string) {
-	file, err := os.Create(filename)
-	if err != nil {
-		conn.Write([]byte("Error creating file\n"))
-		return
+func handleUpload(p *Packet) error {
+	// ensure directory exists
+	dir := filepath.Dir(p.Filename)
+	if dir == "." || dir == "" {
+		// current directory — ok
+	} else {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
 	}
-	defer file.Close()
 
-	_, err = io.Copy(file, reader)
+	f, err := os.Create(p.Filename)
 	if err != nil {
-		fmt.Println("Error receiving file:", err)
-		return
+		return err
 	}
-	fmt.Println("File received", filename)
+	defer f.Close()
+
+	if p.Data != nil && len(p.Data) > 0 {
+		if _, err := f.Write(p.Data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func sendFile(conn net.Conn, filename string) {
-	file, err := os.Open(filename)
+func handleDownload(conn net.Conn, filename string) error {
+	f, err := os.Open(filename)
 	if err != nil {
-		conn.Write([]byte("Error Opening file\n"))
-		return
+		return err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	_, err = io.Copy(conn, file)
+	info, err := f.Stat()
 	if err != nil {
-		fmt.Println("Error sending file:", err)
-		return
+		return err
 	}
-	fmt.Println("File sent:", filename)
+	size := info.Size()
+	data := make([]byte, size)
+	if _, err := io.ReadFull(f, data); err != nil {
+		return err
+	}
 
+	// build an upload-style packet to send the file
+	resp := &Packet{
+		Op:       OpUpload,
+		Filename: filename,
+		FileSize: size,
+		Data:     data,
+	}
+	bytesOut, err := resp.Encode()
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(bytesOut)
+	return err
+}
+
+func sendAck(conn net.Conn, msg string) {
+	p := &Packet{
+		Op:       OpAck,
+		Filename: "",
+		FileSize: int64(len(msg)),
+		Data:     []byte(msg),
+	}
+	b, _ := p.Encode()
+	conn.Write(b)
+}
+
+func sendError(conn net.Conn, msg string) {
+	p := &Packet{
+		Op:       OpError,
+		Filename: "",
+		FileSize: int64(len(msg)),
+		Data:     []byte(msg),
+	}
+	b, _ := p.Encode()
+	conn.Write(b)
 }
